@@ -12,6 +12,9 @@
 
 name: Build N1 Baota Firmware (N1宝塔预装固件)
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -52,9 +55,6 @@ on:
 
 env:
   TZ: Asia/Shanghai
-
-permissions:
-  contents: write
 
 concurrency:
   group: build-n1-baota-firmware
@@ -422,7 +422,7 @@ jobs:
       - name: Upload firmware to GitHub Release
         uses: ophub/upload-to-releases@main
         with:
-          tag_name: ${{ env.release_tag }}
+          tag: ${{ env.release_tag }}
           artifacts: n1-firmware-out/*
           allow_updates: true
           remove_artifacts: false
