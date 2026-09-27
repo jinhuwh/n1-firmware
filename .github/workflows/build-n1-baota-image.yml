@@ -241,6 +241,9 @@ jobs:
           fi
           CHROOT
               sudo pkill -9 -f "BT-Panel" 2>/dev/null || true
+          echo "--- baota_install.log (tail 30) ---"
+          sudo tail -n 30 /tmp/baota_install.log 2>/dev/null || true
+          echo "--- end log tail ---"
 
               sudo rm -f "$MNT/etc/resolv.conf"
               if [ -n "$RESOLV_BAK" ]; then
@@ -390,7 +393,8 @@ jobs:
           echo "=== [6/6] Repack and checksum ==="
           trap - EXIT
           cleanup
-          gzip -9 "$IMG"
+          sudo rm -f /builder/build/output/images/*.img /builder/build/output/images/*.img.gz 2>/dev/null || true
+          gzip -9f "$IMG"
           FINAL_GZ="$IMG.gz"
           sha256sum "$FINAL_GZ" > "$FINAL_GZ.sha"
           mkdir -p n1-firmware-out
