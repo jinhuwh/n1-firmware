@@ -110,7 +110,8 @@ jobs:
       - name: Clean build directory and reclaim disk space
         run: |
           cd /builder/build
-          find . -mindepth 1 -maxdepth 1 ! -name output -exec rm -rf {} +
+          sudo find . -mindepth 1 -maxdepth 1 ! -name output -exec rm -rf {} +
+          sudo chown -R $USER:$USER output || true
           df -h / /builder
 
       - name: Rebuild Armbian for target board (N1)
@@ -139,16 +140,28 @@ jobs:
 
           echo "=== [1/6] Locate rebuilt image ==="
           IMG_GZ=""
-          for d in "${PACKAGED_OUTPUTPATH:-/nonexistent}" "out" "." "/builder/build/output/images"; do
-            [ -d "$d" ] || continue
-            IMG_GZ=$(find "$d" -name "*_${BOARD}*.img.gz" -type f 2>/dev/null | head -n1)
-            [ -n "$IMG_GZ" ] && break
-          done
+          if [ -n "${PACKAGED_OUTPUTPATH:-}" ] && [ -d "${PACKAGED_OUTPUTPATH}" ]; then
+            IMG_GZ=$(ls -t "${PACKAGED_OUTPUTPATH}"/*.img.gz 2>/dev/null | head -n1)
+          fi
+          if [ -z "$IMG_GZ" ] && [ -d "out" ]; then
+            IMG_GZ=$(ls -t out/*.img.gz 2>/dev/null | head -n1)
+          fi
+          if [ -z "$IMG_GZ" ]; then
+            for d in "." "/builder/build/output/images"; do
+              [ -d "$d" ] || continue
+              IMG_GZ=$(find "$d" -name "*${BOARD}*.img.gz" -type f 2>/dev/null | head -n1)
+              [ -n "$IMG_GZ" ] && break
+            done
+          fi
           if [ -z "$IMG_GZ" ]; then
             echo "::error::No rebuilt image found for board $BOARD"
             exit 1
           fi
           echo "Found: $IMG_GZ"
+          mkdir -p n1-bake
+          cp "$IMG_GZ" n1-bake/
+          IMG_GZ="n1-bake/$(basename "$IMG_GZ")"
+          echo "Working copy: $IMG_GZ"
 
           echo "=== [2/6] Expand image and mount rootfs ==="
           gunzip -k "$IMG_GZ" || { echo "::error::gunzip failed"; exit 1; }
