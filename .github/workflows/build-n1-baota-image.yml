@@ -1,0 +1,416 @@
+# ============================================================================
+# N1 宝塔预装固件 - 云端一键构建 (GitHub Actions)
+# ----------------------------------------------------------------------------
+# 用法(3步):
+#   1. 把本文件放到你自己 GitHub 仓库的 .github/workflows/build-n1-baota-image.yml
+#   2. Actions 页选择本工作流 -> Run workflow (参数默认即可)
+#   3. 等 40-90 分钟 -> Releases 下载 *.img.gz -> Rufus DD 模式刷 U 盘
+# 产物: Armbian(bookworm server) + ophub s905d 适配 + 宝塔面板预装
+# 注入模式: auto           = 云端 chroot 预装宝塔(失败自动降级 firstboot)
+#           firstboot_only = 跳过预装, 首次开机联网后自动安装宝塔
+# ============================================================================
+
+name: Build N1 Baota Firmware (N1宝塔预装固件)
+
+on:
+  workflow_dispatch:
+    inputs:
+      set_release:
+        description: "系统版本 (推荐 bookworm)"
+        required: false
+        default: "bookworm"
+        type: choice
+        options: ["bookworm", "trixie", "noble"]
+      armbian_board:
+        description: "目标设备 (N1 = s905d)"
+        required: false
+        default: "s905d"
+        type: choice
+        options: ["s905d", "s905x", "s905x2", "s905x3", "s912"]
+      armbian_kernel:
+        description: "内核版本 (推荐 6.6.y)"
+        required: false
+        default: "6.6.y"
+        type: choice
+        options: ["5.15.y", "6.1.y", "6.6.y", "6.12.y"]
+      kernel_usage:
+        description: "内核通道"
+        required: false
+        default: "stable"
+        type: choice
+        options: ["stable", "flippy", "beta"]
+      baota_port:
+        description: "宝塔面板端口"
+        required: false
+        default: "8888"
+      build_baota_mode:
+        description: "宝塔注入模式 (auto=预装优先)"
+        required: false
+        default: "auto"
+        type: choice
+        options: ["auto", "firstboot_only"]
+
+env:
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-n1-baota-firmware
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    if: github.event.repository.owner.id == github.event.sender.id
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize build environment
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+          docker rmi $(docker images -q) 2>/dev/null || true
+          sudo apt-get update
+          if curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends -o /tmp/ophub-depends.txt 2>/dev/null && [ -s /tmp/ophub-depends.txt ]; then
+            sudo xargs -a /tmp/ophub-depends.txt apt-get install -y || true
+          fi
+          sudo apt-get install -y qemu-user-static binfmt-support kpartx dosfstools e2fsprogs btrfs-progs xfsprogs parted udev || true
+
+      - name: Create virtual disk for extended storage
+        run: |
+          FREE_GB=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
+          EXTEND_GB=$((FREE_GB - 4))
+          echo "Free: ${FREE_GB}G -> extend disk: ${EXTEND_GB}G"
+          sudo truncate -s ${EXTEND_GB}G /root.img
+          LOOPDEV=$(sudo losetup -f --show /root.img)
+          echo "LOOPDEV=$LOOPDEV" >> $GITHUB_ENV
+          sudo mkfs.xfs -f $LOOPDEV
+          sudo mkdir -p /builder
+          sudo mount $LOOPDEV /builder
+          sudo chown -R $USER:$USER /builder
+          df -h / /builder
+
+      - name: Download Armbian source code
+        run: |
+          git clone --depth=1 --branch=main https://github.com/armbian/build.git /builder/build
+          ln -sf /builder/build build
+
+      - name: Compile Armbian base image
+        run: |
+          cd /builder/build
+          ./compile.sh RELEASE=${{ inputs.set_release }} BOARD=odroidn2 BRANCH=current \
+            BUILD_MINIMAL=no BUILD_ONLY=default HOST=armbian BUILD_DESKTOP=no \
+            EXPERT=yes KERNEL_CONFIGURE=no COMPRESS_OUTPUTIMAGE="sha" SHARE_LOG=yes
+
+      - name: Clean build directory and reclaim disk space
+        run: |
+          cd /builder/build
+          find . -mindepth 1 -maxdepth 1 ! -name output -exec rm -rf {} +
+          df -h / /builder
+
+      - name: Rebuild Armbian for target board (N1)
+        uses: ophub/amlogic-s9xxx-armbian@main
+        with:
+          build_target: armbian
+          armbian_path: build/output/images/*.img.gz
+          armbian_board: ${{ inputs.armbian_board }}
+          armbian_kernel: ${{ inputs.armbian_kernel }}
+          auto_kernel: true
+          kernel_repo: ophub/kernel
+          kernel_usage: ${{ inputs.kernel_usage }}
+          armbian_fstype: ext4
+          builder_name: ophub
+
+      - name: Bake Baota panel into firmware
+        id: baota
+        env:
+          BOARD: ${{ inputs.armbian_board }}
+          BAOTA_PORT: ${{ inputs.baota_port }}
+          BAKE_MODE: ${{ inputs.build_baota_mode }}
+          RELEASE_NAME: ${{ inputs.set_release }}
+        run: |
+          set -uo pipefail
+          MNT=/mnt/n1rootfs
+
+          echo "=== [1/6] Locate rebuilt image ==="
+          IMG_GZ=""
+          for d in "${PACKAGED_OUTPUTPATH:-/nonexistent}" "out" "." "/builder/build/output/images"; do
+            [ -d "$d" ] || continue
+            IMG_GZ=$(find "$d" -name "*_${BOARD}*.img.gz" -type f 2>/dev/null | head -n1)
+            [ -n "$IMG_GZ" ] && break
+          done
+          if [ -z "$IMG_GZ" ]; then
+            echo "::error::No rebuilt image found for board $BOARD"
+            exit 1
+          fi
+          echo "Found: $IMG_GZ"
+
+          echo "=== [2/6] Expand image and mount rootfs ==="
+          gunzip -k "$IMG_GZ" || { echo "::error::gunzip failed"; exit 1; }
+          IMG="${IMG_GZ%.gz}"
+          sudo truncate -s +3G "$IMG" || { echo "::error::truncate failed"; exit 1; }
+          LOOP=$(sudo losetup -Pf --show "$IMG") || { echo "::error::losetup failed"; exit 1; }
+          ROOTP="${LOOP}p2"
+          sudo mkdir -p "$MNT"
+
+          cleanup() {
+            sudo umount "$MNT/dev/pts" 2>/dev/null || true
+            sudo umount "$MNT/dev" 2>/dev/null || sudo umount -l "$MNT/dev" 2>/dev/null || true
+            sudo umount "$MNT/proc" 2>/dev/null || sudo umount -l "$MNT/proc" 2>/dev/null || true
+            sudo umount "$MNT/sys" 2>/dev/null || sudo umount -l "$MNT/sys" 2>/dev/null || true
+            sudo umount "$MNT" 2>/dev/null || sudo umount -l "$MNT" 2>/dev/null || true
+            sudo e2fsck -fp "$ROOTP" >/dev/null 2>&1 || true
+            sudo losetup -d "$LOOP" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          sudo e2fsck -fp "$ROOTP"
+          sudo parted -s "$LOOP" resizepart 2 100%
+          sudo resize2fs "$ROOTP"
+          sudo e2fsck -fp "$ROOTP"
+          sudo mount "$ROOTP" "$MNT" || { echo "::error::mount rootfs failed"; exit 1; }
+          sudo mkdir -p "$MNT/root"
+
+          MODE="firstboot"
+          if [ "$BAKE_MODE" != "firstboot_only" ]; then
+            echo "=== [3/6] Chroot pre-install Baota (20-45 min under qemu) ==="
+            docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
+            if sudo test -f /usr/bin/qemu-aarch64-static; then
+              sudo cp /usr/bin/qemu-aarch64-static "$MNT/usr/bin/"
+              sudo mount --bind /dev "$MNT/dev"
+              sudo mount --bind /dev/pts "$MNT/dev/pts"
+              sudo mount -t proc proc "$MNT/proc"
+              sudo mount --bind /sys "$MNT/sys"
+              RESOLV_BAK=""
+              if sudo test -L "$MNT/etc/resolv.conf"; then
+                RESOLV_BAK=$(sudo readlink "$MNT/etc/resolv.conf")
+              fi
+              sudo rm -f "$MNT/etc/resolv.conf"
+              printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" | sudo tee "$MNT/etc/resolv.conf" >/dev/null
+
+              sudo timeout 2700 chroot "$MNT" /bin/bash -s <<'CHROOT' > /tmp/baota_install.log 2>&1 || true
+          export DEBIAN_FRONTEND=noninteractive
+          export LANG=C LC_ALL=C
+          cd /root
+          echo "[chroot] apt-get update"
+          apt-get update -o Acquire::Retries=3
+          echo "[chroot] download Baota installer"
+          OK=0
+          for i in 1 2 3; do
+            curl -fsSL -o /root/install_lts.sh https://download.bt.cn/install/install_lts.sh && OK=1 && break
+            sleep 5
+          done
+          if [ "$OK" -ne 1 ]; then
+            echo "[chroot] FATAL: installer download failed"
+            exit 1
+          fi
+          echo "[chroot] run Baota installer"
+          yes | bash /root/install_lts.sh -y
+          if [ -f /www/server/panel/BT-Panel ] && [ -f /etc/init.d/bt ]; then
+            systemctl enable bt 2>/dev/null || update-rc.d bt defaults || true
+            echo "[chroot] Baota pre-install OK"
+          else
+            echo "[chroot] Baota pre-install VERIFY FAILED"
+            exit 1
+          fi
+          CHROOT
+              sudo pkill -9 -f "BT-Panel" 2>/dev/null || true
+
+              sudo rm -f "$MNT/etc/resolv.conf"
+              if [ -n "$RESOLV_BAK" ]; then
+                sudo ln -s "$RESOLV_BAK" "$MNT/etc/resolv.conf"
+              else
+                printf "nameserver 8.8.8.8\n" | sudo tee "$MNT/etc/resolv.conf" >/dev/null
+              fi
+              sudo umount "$MNT/dev/pts" "$MNT/dev" "$MNT/proc" "$MNT/sys" 2>/dev/null || true
+              sudo rm -f "$MNT/usr/bin/qemu-aarch64-static"
+
+              if sudo test -f "$MNT/www/server/panel/BT-Panel" && sudo test -f "$MNT/etc/init.d/bt"; then
+                MODE="preinstalled"
+              else
+                echo "::warning::chroot pre-install failed -> fallback to firstboot mode"
+                sudo rm -rf "$MNT/www/server/panel" || true
+              fi
+            else
+              echo "::warning::qemu-aarch64-static missing -> firstboot mode"
+            fi
+          else
+            echo "=== [3/6] Skip chroot (firstboot_only mode) ==="
+          fi
+
+          echo "=== [4/6] Bake stability configs ==="
+          sudo tee "$MNT/etc/sysctl.d/99-n1-baota.conf" >/dev/null <<'CONF'
+          vm.swappiness=10
+          vm.min_free_kbytes=32768
+          net.core.somaxconn=2048
+          net.ipv4.tcp_max_syn_backlog=1024
+          CONF
+          sudo mkdir -p "$MNT/etc/systemd/system.conf.d" "$MNT/etc/modules-load.d"
+          sudo tee "$MNT/etc/systemd/system.conf.d/10-watchdog.conf" >/dev/null <<'CONF'
+          [Manager]
+          RuntimeWatchdogSec=15
+          CONF
+          sudo tee "$MNT/etc/modules-load.d/meson_gxbb_wdt.conf" >/dev/null <<'CONF'
+          meson_gxbb_wdt
+          CONF
+          echo "n1-baota" | sudo tee "$MNT/etc/hostname" >/dev/null
+          grep -q "n1-baota" "$MNT/etc/hosts" 2>/dev/null || echo "127.0.1.1 n1-baota" | sudo tee -a "$MNT/etc/hosts" >/dev/null
+          if ! sudo test -e "$MNT/swapfile"; then
+            sudo fallocate -l 1024M "$MNT/swapfile"
+            sudo chmod 600 "$MNT/swapfile"
+            sudo mkswap "$MNT/swapfile"
+            grep -q "^/swapfile" "$MNT/etc/fstab" 2>/dev/null || echo "/swapfile none swap sw 0 0" | sudo tee -a "$MNT/etc/fstab" >/dev/null
+          fi
+
+          echo "=== [5/6] Write panel info / firstboot fallback ==="
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          if [ "$MODE" = "preinstalled" ]; then
+            sudo bash -c "echo '$BAOTA_PORT' > '$MNT/www/server/panel/data/port.pl'"
+            BT_USER=$(sudo cat "$MNT/www/server/panel/data/username.pl" 2>/dev/null || true)
+            BT_PASS=$(sudo cat "$MNT/www/server/panel/default.pl" 2>/dev/null || true)
+            BT_ENTRY=$(sudo cat "$MNT/www/server/panel/data/admin_path.pl" 2>/dev/null || true)
+            BT_ENTRY=${BT_ENTRY#/}
+            if [ -z "$BT_USER" ]; then
+              BT_USER=$(grep -aoE "username:[ ]*[A-Za-z0-9]+" /tmp/baota_install.log | tail -n1 | awk '{print $2}')
+            fi
+            if [ -z "$BT_PASS" ]; then
+              BT_PASS=$(grep -aoE "password:[ ]*[A-Za-z0-9]+" /tmp/baota_install.log | tail -n1 | awk '{print $2}')
+            fi
+            sudo cp /tmp/baota_install.log "$MNT/root/baota-install.log" || true
+            sudo tee "$MNT/root/BAOTA-INFO.txt" >/dev/null <<EOF
+          ================================================
+           金狐 N1 宝塔预装固件 (Armbian + 宝塔面板)
+          ================================================
+          镜像模式 : 预装模式 -- 开机后宝塔面板已就绪
+          面板地址 : http://<N1的IP地址>:$BAOTA_PORT/$BT_ENTRY
+          面板账号 : $BT_USER
+          面板密码 : $BT_PASS
+          默认 SSH : root / 1234 (首次登录会强制修改)
+
+          安全提醒:
+           1. 立即修改宝塔面板账号密码
+           2. 建议修改面板端口与安全入口
+           3. 面板仅限内网使用, 切勿暴露公网
+           4. 金狐开单系统部署: 宝塔内安装 Nginx + PHP 8.2 + MySQL
+
+          安装日志 : /root/baota-install.log
+          构建时间 : $BUILD_DATE
+          ================================================
+          EOF
+          else
+            sudo tee "$MNT/usr/local/bin/n1-install-baota.sh" >/dev/null <<'EOS'
+          #!/bin/bash
+          exec >> /root/baota-install.log 2>&1
+          echo "[$(date)] firstboot Baota install start"
+          cd /root
+          OK=0
+          for i in 1 2 3 4 5; do
+            curl -fsSL -o /root/install_lts.sh https://download.bt.cn/install/install_lts.sh && OK=1 && break
+            sleep 15
+          done
+          if [ "$OK" -ne 1 ]; then
+            echo "[$(date)] installer download failed"
+            exit 1
+          fi
+          bash /root/install_lts.sh -y
+          if [ -f /www/server/panel/BT-Panel ] && [ -f /etc/init.d/bt ]; then
+            echo "$BAOTA_PORT" > /www/server/panel/data/port.pl
+            systemctl enable bt 2>/dev/null || update-rc.d bt defaults || true
+            touch /root/.baota-firstboot-done
+            systemctl disable n1-baota-firstboot.service 2>/dev/null || true
+            echo "[$(date)] Baota installed OK"
+          else
+            echo "[$(date)] Baota install verify failed, will retry on next boot"
+            exit 1
+          fi
+          EOS
+            sudo chmod 755 "$MNT/usr/local/bin/n1-install-baota.sh"
+            sudo tee "$MNT/etc/systemd/system/n1-baota-firstboot.service" >/dev/null <<EOS
+          [Unit]
+          Description=N1 firstboot Baota panel installer
+          Wants=network-online.target
+          After=network-online.target
+          ConditionPathExists=!/www/server/panel/BT-Panel
+
+          [Service]
+          Type=oneshot
+          Environment=BAOTA_PORT=$BAOTA_PORT
+          ExecStart=/usr/local/bin/n1-install-baota.sh
+          Restart=on-failure
+          StartLimitIntervalSec=0
+
+          [Install]
+          WantedBy=multi-user.target
+          EOS
+            sudo mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants"
+            sudo ln -sf ../n1-baota-firstboot.service "$MNT/etc/systemd/system/multi-user.target.wants/n1-baota-firstboot.service"
+            sudo tee "$MNT/root/BAOTA-INFO.txt" >/dev/null <<EOF
+          ================================================
+           金狐 N1 宝塔固件 (Armbian + 宝塔面板)
+          ================================================
+          镜像模式 : 首次开机自动安装模式
+          说明     : 第一次开机联网后自动安装宝塔面板
+                     约 15-25 分钟完成, 期间请勿断电断网
+          完成后   : 面板地址 http://<N1的IP地址>:$BAOTA_PORT
+                     账号密码见 /root/baota-install.log 或执行 bt 14
+          默认 SSH : root / 1234 (首次登录会强制修改)
+
+          安全提醒 : 立即改密 / 改端口 / 仅限内网使用
+          构建时间 : $BUILD_DATE
+          ================================================
+          EOF
+          fi
+
+          echo "=== [6/6] Repack and checksum ==="
+          trap - EXIT
+          cleanup
+          gzip -9 "$IMG"
+          FINAL_GZ="$IMG.gz"
+          sha256sum "$FINAL_GZ" > "$FINAL_GZ.sha"
+          mkdir -p n1-firmware-out
+          cp "$FINAL_GZ" "$FINAL_GZ.sha" n1-firmware-out/
+          RELEASE_TAG="Armbian_${RELEASE_NAME}_${BOARD}_baota_$(date +%Y.%m)"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### N1 宝塔固件构建结果"
+            echo "- 注入模式: **$MODE** (preinstalled=开机即用 / firstboot=首次开机自动安装)"
+            echo "- 镜像: $(basename "$FINAL_GZ") ($(du -h "$FINAL_GZ" | cut -f1))"
+            echo "- 设备: $BOARD | 系统: $RELEASE_NAME"
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -lh n1-firmware-out/
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: n1-baota-firmware
+          path: n1-firmware-out/*
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload firmware to GitHub Release
+        uses: ophub/upload-to-releases@main
+        with:
+          tag_name: ${{ env.release_tag }}
+          artifacts: n1-firmware-out/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### N1 宝塔预装固件 (Armbian + Baota Panel)
+            - 设备: Phicomm N1 (Amlogic S905D) — ${{ inputs.armbian_board }}
+            - 系统: Armbian ${{ inputs.set_release }} server / ext4
+            - 内核: ${{ inputs.armbian_kernel }} (${{ inputs.kernel_usage }})
+            - 宝塔注入模式: **${{ steps.baota.outputs.mode }}**
+              - `preinstalled` = 开机即用, 面板信息见固件内 /root/BAOTA-INFO.txt
+              - `firstboot` = 首次开机联网后自动安装宝塔 (15-25 分钟)
+            - 刷机: Rufus (DD 模式) 写入 U 盘 → N1 U 盘启动 (root/1234) → `armbian-install` 选 101 写入 eMMC
+            - 安全提醒: 首次登录后立即修改 SSH 与宝塔密码, 面板仅限内网使用
